@@ -1,43 +1,43 @@
 # macOS Disk Mounter (SmartSSDManager)
 
-A background daemon and web-based settings UI for macOS that intelligently manages external SSDs and their partitions. It automatically unmounts drives when they are idle or when the Mac goes to sleep, preventing the infamous "Disk Not Ejected Properly" errors on flaky USB-C connections.
+Фоновый демон и удобная веб-панель настроек для macOS, которые грамотно управляют внешними SSD-накопителями и их разделами. Утилита автоматически отмонтирует диски при их простое или перед тем, как Mac уйдёт в спящий режим. Это раз и навсегда решает раздражающую проблему с ошибкой "Диск не был извлечён должным образом" (Disk Not Ejected Properly) при нестабильных подключениях USB-C.
 
-## Features
-- **Auto-Unmount on Sleep:** Instantly unmounts your physical external drives right before the system goes to sleep.
-- **Idle Timeout:** Automatically unmounts drives if no files are being accessed for a specified amount of time.
-- **Robust Physical Disk Resolution:** Properly unmounts the entire physical disk (e.g., `disk4`) rather than just virtual APFS containers (`disk5`), ensuring the drive is truly safe to unplug.
-- **Web UI Settings:** A modern, dark-mode friendly web interface (running locally via Python) to add/remove volumes, change the idle timer, and automatically generate smart desktop shortcuts.
-- **Smart Shortcuts:** Automatically generated macOS `.app` shortcuts for your desktop that mount the drive (if it was auto-ejected) and open it in Finder.
+## Возможности
+- **Автоотмонтирование при сне:** Мгновенно извлекает физические внешние диски прямо перед тем, как система уснёт.
+- **Таймер бездействия (Idle Timeout):** Автоматически отмонтирует диски, если к ним никто не обращается заданное время.
+- **Умное определение физических дисков:** Корректно находит и извлекает весь физический диск (например, `disk4`), а не только его виртуальные контейнеры APFS (например, `disk5`), гарантируя, что диск действительно безопасно выдёргивать.
+- **Настройки в браузере (Web UI):** Современный тёмный интерфейс (работает через локальный Python-сервер), где можно добавлять/удалять тома, менять таймер и генерировать ярлыки.
+- **Умные ярлыки:** Автоматически создает `.app` ярлыки на Рабочем столе. При клике они сами монтируют диск (если он был извлечён) и сразу открывают его в Finder.
 
-## Components
-- `SmartSSDManager.swift` - A lightweight Swift daemon that runs in the background.
-- `smartssd_settings.py` - A Python script running a local HTTP server for settings management.
+## Компоненты
+- `SmartSSDManager.swift` — Лёгкий демон на Swift, работающий в фоне.
+- `smartssd_settings.py` — Python-скрипт, поднимающий локальный HTTP-сервер для панели настроек.
 
-## Installation
+## Установка
 
-1. Clone this repository:
+1. Склонируйте этот репозиторий:
    ```bash
-   git clone https://github.com/EdelWeiss228/macOS-disk-mouter.git
-   cd macOS-disk-mouter
+   git clone https://github.com/EdelWeiss228/SmartSSDManager.git
+   cd SmartSSDManager
    ```
-2. Make the install script executable and run it:
+2. Сделайте скрипт установки исполняемым и запустите его:
    ```bash
    chmod +x install.sh
    ./install.sh
    ```
 
-This will:
-- Compile the Swift daemon.
-- Install the binaries to `~/.local/bin`.
-- Register the daemon with `launchd` so it starts automatically on login.
+Скрипт выполнит следующие действия:
+- Скомпилирует Swift-демона.
+- Установит исполняемые файлы в `~/.local/bin`.
+- Зарегистрирует демона в `launchd`, чтобы он запускался автоматически при старте системы.
 
-## Usage
+## Использование
 
-To configure the daemon, run the settings UI:
+Для настройки демона запустите веб-интерфейс:
 ```bash
 python3 ~/.local/bin/smartssd_settings.py
 ```
-This will open a settings panel in your web browser where you can:
-- Add volume names (as seen in `diskutil list`) to track.
-- Set the idle timeout duration.
-- The UI will automatically create Desktop shortcuts for added volumes.
+Откроется панель настроек в вашем браузере, где вы сможете:
+- Добавить имена томов (как они отображаются в `diskutil list`), за которыми нужно следить.
+- Задать время простоя для таймера автоотмонтирования.
+- Автоматически сгенерировать ярлыки на Рабочем столе для добавленных томов.
