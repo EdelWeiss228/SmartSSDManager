@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
 """SmartSSD Settings — opens in browser via local HTTP server."""
 
-import json, os, subprocess, shutil, threading, webbrowser
+import html
+import json
+import os
+import plistlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
+from xml.sax.saxutils import escape as xml_escape
 
 HOME        = os.path.expanduser("~")
 BIN         = os.path.join(HOME, ".local", "bin")
@@ -12,36 +23,94 @@ PLIST_PATH  = os.path.join(HOME, "Library", "LaunchAgents", "com.user.smartssd.p
 ICON_PATH   = "/System/Library/Extensions/IOStorageFamily.kext/Contents/Resources/External.icns"
 DESKTOP     = os.path.join(HOME, "Desktop")
 PORT        = 19432
+LABEL       = "com.user.smartssd"
 
 LSREGISTER  = ("/System/Library/Frameworks/CoreServices.framework"
                "/Frameworks/LaunchServices.framework/Support/lsregister")
 
+DEFAULTS = {
+    "volumes": [],
+    "timeoutMinutes": 10,
+    "cooldownMinutes": 10,
+    "forceUnmount": False,
+    "unmountOnSleep": True,
+}
+
 # ── Config ──────────────────────────────────────────────────────────────────────
 def load_config():
+    cfg = dict(DEFAULTS)
     try:
         with open(CONFIG_PATH) as f:
-            return json.load(f)
+            data = json.load(f)
+        if isinstance(data, dict):
+            cfg.update(data)
     except Exception:
-        return {"volumes": [], "timeoutMinutes": 5}
+        pass
+
+    cfg["volumes"] = [str(v).strip() for v in cfg.get("volumes", []) if str(v).strip()]
+    try:
+        cfg["timeoutMinutes"] = max(1, min(120, int(cfg.get("timeoutMinutes", 10))))
+    except Exception:
+        cfg["timeoutMinutes"] = 10
+    try:
+        cfg["cooldownMinutes"] = max(1, min(1440, int(cfg.get("cooldownMinutes", 10))))
+    except Exception:
+        cfg["cooldownMinutes"] = 10
+    cfg["forceUnmount"] = bool(cfg.get("forceUnmount", False))
+    cfg["unmountOnSleep"] = bool(cfg.get("unmountOnSleep", True))
+    return cfg
 
 def save_config(cfg):
-    with open(CONFIG_PATH, "w") as f:
+    os.makedirs(BIN, exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, CONFIG_PATH)
+
+def known_volume_names():
+    """Return all volume names currently known to diskutil (mounted or not)."""
+    try:
+        out = subprocess.run(["/usr/sbin/diskutil", "list", "-plist"],
+                             capture_output=True, timeout=15).stdout
+        data = plistlib.loads(out)
+        names = []
+
+        def walk(node):
+            if isinstance(node, dict):
+                name = node.get("VolumeName")
+                if name:
+                    names.append(name)
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(data.get("AllDisksAndPartitions", []))
+        return names
+    except Exception:
+        return []
+
+def is_valid_volume_name(name: str) -> bool:
+    return (bool(name) and "/" not in name and ":" not in name
+            and name not in (".", "..") and not any(ord(c) < 32 for c in name))
 
 # ── Shortcuts ───────────────────────────────────────────────────────────────────
 LAUNCHER_SH = """\
 #!/bin/bash
-DISK_ID=$(diskutil list | grep '{vol}' | awk '{{print $NF}}')
+VOL={volq}
+DISK_ID=$(diskutil list | grep -F -- "$VOL" | awk '{{print $NF}}' | head -n 1)
 if [ -z "$DISK_ID" ]; then
     osascript -e 'display alert "Диск не найден" message "Убедитесь, что SSD подключён к Mac." as warning'
     exit 1
 fi
 diskutil mount "$DISK_ID" 2>/dev/null
 for i in 1 2 3 4 5; do
-    [ -d "/Volumes/{vol}" ] && break; sleep 1
+    [ -d "/Volumes/$VOL" ] && break
+    sleep 1
 done
-if [ -d "/Volumes/{vol}" ]; then
-    open "/Volumes/{vol}"
+if [ -d "/Volumes/$VOL" ]; then
+    open "/Volumes/$VOL"
 else
     osascript -e 'display alert "Не удалось смонтировать" message "Попробуйте переподключить SSD." as warning'
 fi
@@ -61,7 +130,7 @@ INFO_PLIST = """\
 """
 
 def create_shortcut(vol: str):
-    safe  = vol.replace(" ", "-").lower()
+    safe  = re.sub(r"[^a-z0-9]+", "-", vol.lower()).strip("-") or "disk"
     app   = os.path.join(DESKTOP, f"{vol}.app")
     macos = os.path.join(app, "Contents", "MacOS")
     res   = os.path.join(app, "Contents", "Resources")
@@ -70,39 +139,64 @@ def create_shortcut(vol: str):
     if os.path.exists(ICON_PATH):
         shutil.copy(ICON_PATH, os.path.join(res, "SSDDisk.icns"))
     with open(os.path.join(app, "Contents", "Info.plist"), "w") as f:
-        f.write(INFO_PLIST.format(label=vol, safe=safe))
+        f.write(INFO_PLIST.format(label=xml_escape(vol), safe=safe))
     launcher = os.path.join(macos, "launcher")
     with open(launcher, "w") as f:
-        f.write(LAUNCHER_SH.format(vol=vol))
+        f.write(LAUNCHER_SH.format(volq=shlex.quote(vol)))
     os.chmod(launcher, 0o755)
     subprocess.run([LSREGISTER, "-f", app], capture_output=True)
 
 def remove_shortcut(vol: str):
     app = os.path.join(DESKTOP, f"{vol}.app")
     if os.path.exists(app):
+        subprocess.run([LSREGISTER, "-u", app], capture_output=True)
         shutil.rmtree(app)
 
 def restart_daemon():
-    subprocess.run(["launchctl", "unload", PLIST_PATH], capture_output=True)
-    subprocess.run(["launchctl", "load",   PLIST_PATH], capture_output=True)
+    disabled = PLIST_PATH + ".disabled"
+    if not os.path.exists(PLIST_PATH) and os.path.exists(disabled):
+        os.replace(disabled, PLIST_PATH)
+    if not os.path.exists(PLIST_PATH):
+        return False, "LaunchAgent не найден. Запустите install.sh."
+
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(["/bin/launchctl", "bootout", f"{domain}/{LABEL}"],
+                   capture_output=True)
+    subprocess.run(["/bin/launchctl", "enable", f"{domain}/{LABEL}"],
+                   capture_output=True)
+    result = subprocess.run(["/bin/launchctl", "bootstrap", domain, PLIST_PATH],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        fallback = subprocess.run(["/bin/launchctl", "load", "-w", PLIST_PATH],
+                                  capture_output=True, text=True)
+        if fallback.returncode != 0:
+            err = (result.stderr or fallback.stderr or "launchctl error").strip()
+            return False, f"Не удалось запустить демон: {err}"
+    return True, "Демон перезапущен с новыми настройками"
 
 # ── HTML ────────────────────────────────────────────────────────────────────────
-def render_html(msg=""):
+def render_html(msg="", error=False):
     cfg  = load_config()
-    vols = cfg.get("volumes", [])
-    t    = cfg.get("timeoutMinutes", 5)
+    vols = cfg["volumes"]
+    t    = cfg["timeoutMinutes"]
 
     rows = "".join(
         f"""<tr>
-              <td><span class="vol-name">{v}</span></td>
-              <td><a class="del-btn" href="/delete?vol={v}">✕</a></td>
+              <td><span class="vol-name">{html.escape(v)}</span></td>
+              <td><a class="del-btn" href="/delete?vol={quote(v)}">✕</a></td>
             </tr>"""
         for v in vols
     )
     if not rows:
         rows = '<tr><td colspan="2" style="color:#6c7086;text-align:center;">Список пуст</td></tr>'
 
-    status_html = f'<div class="status ok">{msg}</div>' if msg else ""
+    status_html = ""
+    if msg:
+        cls = "err" if error else "ok"
+        status_html = f'<div class="status {cls}">{html.escape(msg)}</div>'
+
+    force_checked = "checked" if cfg["forceUnmount"] else ""
+    sleep_checked = "checked" if cfg["unmountOnSleep"] else ""
 
     return f"""<!DOCTYPE html>
 <html lang="ru">
@@ -124,7 +218,7 @@ def render_html(msg=""):
   }}
   .card {{
     background: var(--surface); border: 1px solid var(--border);
-    border-radius: 16px; padding: 32px; width: 480px;
+    border-radius: 16px; padding: 32px; width: 520px;
     box-shadow: 0 20px 60px rgba(0,0,0,.5);
   }}
   h1 {{ font-size: 22px; font-weight: 600; margin-bottom: 6px; }}
@@ -167,12 +261,14 @@ def render_html(msg=""):
     width: 100%; padding: 12px; font-size: 15px;
     border-radius: 10px; margin-top: 4px;
   }}
-  .status.ok {{
-    background: rgba(166,227,161,.12); border: 1px solid var(--green);
-    color: var(--green); border-radius: 8px; padding: 10px 14px;
-    font-size: 13px; margin-top: 16px;
-  }}
+  .status {{ border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-top: 16px; }}
+  .status.ok {{ background: rgba(166,227,161,.12); border: 1px solid var(--green); color: var(--green); }}
+  .status.err {{ background: rgba(243,139,168,.12); border: 1px solid var(--red); color: var(--red); }}
   .vol-name {{ font-family: "SF Mono", monospace; font-size: 13px; }}
+  .check-row {{ display: flex; align-items: flex-start; gap: 10px; margin-bottom: 10px;
+                font-size: 13px; color: var(--text); }}
+  .check-row input {{ margin-top: 2px; }}
+  .hint {{ color: var(--muted); font-size: 12px; margin-top: 8px; line-height: 1.4; }}
 </style>
 </head>
 <body>
@@ -187,6 +283,8 @@ def render_html(msg=""):
       <input type="text" name="vol" placeholder="Имя тома из diskutil list" required>
       <button type="submit">＋ Добавить</button>
     </form>
+    <p class="hint">Имя должно совпадать с названием тома. Если том сейчас не подключён,
+    он начнёт отслеживаться, когда появится.</p>
   </section>
 
   <section>
@@ -195,6 +293,22 @@ def render_html(msg=""):
       <input type="number" name="t" value="{t}" min="1" max="120" required>
       <span class="timer-label">минут без активности → авто-извлечение</span>
       <button type="submit">✓</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>Безопасность</h2>
+    <form action="/save_safety" method="get">
+      <label class="check-row">
+        <input type="checkbox" name="force" value="1" {force_checked}>
+        <span>Принудительное извлечение, даже если диск занят.<br>
+        <b>Риск потери данных.</b> По умолчанию выключено.</span>
+      </label>
+      <label class="check-row">
+        <input type="checkbox" name="sleep" value="1" {sleep_checked}>
+        <span>Извлекать диски перед уходом Mac в сон</span>
+      </label>
+      <button type="submit">✓ Сохранить</button>
     </form>
   </section>
 
@@ -211,16 +325,19 @@ def render_html(msg=""):
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass   # silence access log
 
-    def _respond(self, html, status=200):
-        body = html.encode()
+    def _respond(self, html_text, status=200):
+        body = html_text.encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def _redirect(self, msg=""):
-        loc = f"/?msg={msg}" if msg else "/"
+    def _redirect(self, msg="", error=False):
+        if msg:
+            loc = "/?msg=" + quote(msg) + ("&err=1" if error else "")
+        else:
+            loc = "/"
         self.send_response(302)
         self.send_header("Location", loc)
         self.end_headers()
@@ -231,40 +348,60 @@ class Handler(BaseHTTPRequestHandler):
         path   = parsed.path
 
         if path == "/":
-            msg = qs.get("msg", [""])[0]
-            self._respond(render_html(msg))
+            msg   = qs.get("msg", [""])[0]
+            error = qs.get("err", ["0"])[0] == "1"
+            self._respond(render_html(msg, error))
 
         elif path == "/add":
             vol = qs.get("vol", [""])[0].strip()
-            if vol:
-                cfg = load_config()
-                if vol not in cfg["volumes"]:
-                    cfg["volumes"].append(vol)
-                    save_config(cfg)
-                    create_shortcut(vol)
+            if not is_valid_volume_name(vol):
+                self._redirect("Некорректное имя тома", error=True)
+                return
+            cfg = load_config()
+            if vol not in cfg["volumes"]:
+                known = known_volume_names()
+                cfg["volumes"].append(vol)
+                save_config(cfg)
+                create_shortcut(vol)
+                if known and not any(n.startswith(vol) or vol.startswith(n) for n in known):
+                    self._redirect(f"Том «{vol}» добавлен, но сейчас не найден. "
+                                   "Он начнёт отслеживаться, когда появится.")
+                    return
             self._redirect(f"Добавлен том «{vol}» и создан ярлык на Рабочем столе")
 
         elif path == "/delete":
             vol = qs.get("vol", [""])[0].strip()
-            if vol:
-                cfg = load_config()
-                cfg["volumes"] = [v for v in cfg["volumes"] if v != vol]
-                save_config(cfg)
-                remove_shortcut(vol)
+            if not is_valid_volume_name(vol):
+                self._redirect("Некорректное имя тома", error=True)
+                return
+            cfg = load_config()
+            cfg["volumes"] = [v for v in cfg["volumes"] if v != vol]
+            save_config(cfg)
+            remove_shortcut(vol)
             self._redirect(f"Удалён том «{vol}»")
 
         elif path == "/save_timer":
-            t = qs.get("t", ["5"])[0]
+            t = qs.get("t", ["10"])[0]
             try: t = max(1, min(120, int(t)))
-            except: t = 5
+            except Exception: t = 10
             cfg = load_config()
             cfg["timeoutMinutes"] = t
             save_config(cfg)
             self._redirect(f"Таймер установлен: {t} мин")
 
+        elif path == "/save_safety":
+            cfg = load_config()
+            cfg["forceUnmount"] = qs.get("force", [""])[0] == "1"
+            cfg["unmountOnSleep"] = qs.get("sleep", [""])[0] == "1"
+            save_config(cfg)
+            if cfg["forceUnmount"]:
+                self._redirect("Сохранено. ВНИМАНИЕ: включено принудительное извлечение.")
+            else:
+                self._redirect("Настройки безопасности сохранены")
+
         elif path == "/save_and_restart":
-            restart_daemon()
-            self._redirect("✅ Демон перезапущен с новыми настройками")
+            ok, msg = restart_daemon()
+            self._redirect(msg, error=not ok)
 
         elif path == "/quit":
             self._respond("<script>window.close()</script>")
@@ -275,9 +412,14 @@ class Handler(BaseHTTPRequestHandler):
 
 # ── Entry point ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    server = HTTPServer(("127.0.0.1", PORT), Handler)
-    url    = f"http://127.0.0.1:{PORT}/"
-    # Open browser after short delay (server needs to be up first)
+    url = f"http://127.0.0.1:{PORT}/"
+    try:
+        server = HTTPServer(("127.0.0.1", PORT), Handler)
+    except OSError:
+        # Another instance is already running — just open it.
+        webbrowser.open(url)
+        sys.exit(0)
+
     threading.Timer(0.3, lambda: webbrowser.open(url)).start()
     print(f"SmartSSD Settings running at {url}  (close browser tab to stop)")
     try:
