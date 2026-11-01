@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import webbrowser
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 from xml.sax.saxutils import escape as xml_escape
@@ -28,6 +29,7 @@ LABEL       = "com.user.smartssd"
 
 LSREGISTER  = ("/System/Library/Frameworks/CoreServices.framework"
                "/Frameworks/LaunchServices.framework/Support/lsregister")
+DISKUTIL    = "/usr/sbin/diskutil"
 
 DEFAULTS = {
     "volumes": [],
@@ -68,29 +70,176 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2, ensure_ascii=False)
     os.replace(tmp, CONFIG_PATH)
 
-def known_volume_names():
-    """Return all volume names currently known to diskutil (mounted or not)."""
+def _diskutil_plist(*args, timeout=10):
     try:
-        out = subprocess.run(["/usr/sbin/diskutil", "list", "-plist"],
-                             capture_output=True, timeout=15).stdout
-        data = plistlib.loads(out)
-        names = []
-
-        def walk(node):
-            if isinstance(node, dict):
-                name = node.get("VolumeName")
-                if name:
-                    names.append(name)
-                for value in node.values():
-                    walk(value)
-            elif isinstance(node, list):
-                for value in node:
-                    walk(value)
-
-        walk(data.get("AllDisksAndPartitions", []))
-        return names
+        result = subprocess.run([DISKUTIL, *args], capture_output=True,
+                                timeout=timeout)
+        if result.returncode != 0:
+            return {}
+        return plistlib.loads(result.stdout)
     except Exception:
+        return {}
+
+def _disk_info(identifier):
+    return _diskutil_plist("info", "-plist", identifier)
+
+@lru_cache(maxsize=1)
+def _boot_physical_disk_ids():
+    """Physical whole disks that host the running system. Never offer them."""
+    info = _disk_info("/")
+    ids = set()
+
+    stores = info.get("APFSPhysicalStores") or []
+    for store in stores:
+        if not isinstance(store, dict):
+            continue
+        store_id = store.get("APFSPhysicalStore") or store.get("DeviceIdentifier")
+        if not store_id:
+            continue
+        store_info = _disk_info(store_id)
+        parent = store_info.get("ParentWholeDisk") or store_id
+        if parent:
+            ids.add(parent)
+
+    parent = info.get("ParentWholeDisk")
+    if parent:
+        parent_info = _disk_info(parent)
+        if (parent_info.get("WholeDisk") and
+                parent_info.get("VirtualOrPhysical") not in ("Virtual", "Synthesized")):
+            ids.add(parent)
+        for store in parent_info.get("APFSPhysicalStores") or []:
+            if not isinstance(store, dict):
+                continue
+            store_id = store.get("APFSPhysicalStore") or store.get("DeviceIdentifier")
+            if store_id:
+                store_info = _disk_info(store_id)
+                store_parent = store_info.get("ParentWholeDisk") or store_id
+                if store_parent:
+                    ids.add(store_parent)
+
+    return ids
+
+def list_external_volumes():
+    """Return volumes on connected external physical disks.
+
+    Internal disks, disk images, synthesized APFS containers and the boot
+    disk are intentionally excluded. Unmounted volumes are included so they
+    can be selected before the daemon mounts/unmounts them.
+    """
+    data = _diskutil_plist("list", "-plist")
+    entries = data.get("AllDisksAndPartitions") or []
+    if not isinstance(entries, list):
         return []
+
+    boot_ids = _boot_physical_disk_ids()
+    whole_entries = {}
+    external = set()
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        whole_id = entry.get("DeviceIdentifier")
+        if not whole_id:
+            continue
+        whole_entries[whole_id] = entry
+
+        info = _disk_info(whole_id)
+        if not info.get("WholeDisk"):
+            continue
+        if info.get("Internal") is True:
+            continue
+        if info.get("VirtualOrPhysical") in ("Virtual", "Synthesized"):
+            continue
+        if info.get("BusProtocol") == "Disk Image":
+            continue
+        if not (info.get("Ejectable") or
+                info.get("RemovableMediaOrExternalDevice")):
+            continue
+        if whole_id in boot_ids:
+            continue
+        external.add(whole_id)
+
+    # Map every partition slice back to its external whole disk. This is
+    # needed to resolve APFS volumes, which live on a synthesized container.
+    partition_to_whole = {}
+    for whole_id in external:
+        for part in whole_entries[whole_id].get("Partitions") or []:
+            part_id = part.get("DeviceIdentifier")
+            if part_id:
+                partition_to_whole[part_id] = whole_id
+
+    volumes = []
+    seen_names = set()
+
+    def add_volume(name, device, mount_point, size, whole_id):
+        name = str(name or "").strip()
+        if not name or not is_valid_volume_name(name):
+            return
+        if name in seen_names:
+            return
+        if whole_id in boot_ids:
+            return
+        mount_point = str(mount_point or "")
+        if mount_point == "/" or mount_point.startswith("/System/Volumes/"):
+            return
+        seen_names.add(name)
+        volumes.append({
+            "name": name,
+            "device": str(device or ""),
+            "mount_point": mount_point,
+            "mounted": bool(mount_point),
+            "size": size if isinstance(size, int) else 0,
+            "whole_disk": whole_id,
+        })
+
+    # Ordinary partitions: ExFAT, NTFS, HFS+, FAT, etc.
+    for whole_id in external:
+        for part in whole_entries[whole_id].get("Partitions") or []:
+            add_volume(part.get("VolumeName"), part.get("DeviceIdentifier"),
+                       part.get("MountPoint"), part.get("Size"), whole_id)
+
+    # APFS volumes: physical disk -> partition store -> synthesized container.
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        apfs_volumes = entry.get("APFSVolumes") or []
+        if not apfs_volumes:
+            continue
+        stores = []
+        for store in entry.get("APFSPhysicalStores") or []:
+            if isinstance(store, dict):
+                store_id = store.get("DeviceIdentifier") or store.get("APFSPhysicalStore")
+                if store_id:
+                    stores.append(store_id)
+        if not stores:
+            continue
+        wholes = [partition_to_whole.get(store_id) for store_id in stores]
+        if any(whole_id not in external for whole_id in wholes):
+            continue
+        whole_id = wholes[0]
+        for volume in apfs_volumes:
+            add_volume(volume.get("VolumeName"), volume.get("DeviceIdentifier"),
+                       volume.get("MountPoint"), volume.get("Size"), whole_id)
+
+    volumes.sort(key=lambda volume: (not volume["mounted"],
+                                     volume["name"].lower()))
+    return volumes
+
+def format_size(size):
+    try:
+        value = float(size)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    units = ("Б", "КБ", "МБ", "ГБ", "ТБ", "ПБ")
+    index = 0
+    while value >= 1000 and index < len(units) - 1:
+        value /= 1000
+        index += 1
+    if index == 0:
+        return f"{int(value)} {units[index]}"
+    return f"{value:.1f} {units[index]}"
 
 def is_valid_volume_name(name: str) -> bool:
     return (bool(name) and "/" not in name and ":" not in name
@@ -213,19 +362,94 @@ def restart_daemon():
 
 # ── HTML ────────────────────────────────────────────────────────────────────────
 def render_html(msg="", error=False):
-    cfg  = load_config()
+    cfg = load_config()
     vols = cfg["volumes"]
-    t    = cfg["timeoutMinutes"]
+    t = cfg["timeoutMinutes"]
+    external = list_external_volumes()
+    external_by_name = {info["name"]: info for info in external}
+    configured = set(vols)
 
-    rows = "".join(
-        f"""<tr>
-              <td><span class="vol-name">{html.escape(v)}</span></td>
-              <td><a class="del-btn" href="/delete?vol={quote(v)}">✕</a></td>
+    # Volumes already tracked by the daemon.
+    rows = ""
+    for vol in vols:
+        info = external_by_name.get(vol)
+        if info is None:
+            badge_cls, badge_text = "missing", "не найден"
+            meta = '<div class="vol-meta">нет среди подключённых внешних томов</div>'
+        else:
+            if info["mounted"]:
+                badge_cls, badge_text = "mounted", "смонтирован"
+            else:
+                badge_cls, badge_text = "unmounted", "не смонтирован"
+            meta_bits = [html.escape(info["device"])]
+            if info["mount_point"]:
+                meta_bits.append(html.escape(info["mount_point"]))
+            size = format_size(info["size"])
+            if size:
+                meta_bits.append(html.escape(size))
+            meta = '<div class="vol-meta">' + " · ".join(meta_bits) + "</div>"
+        rows += f"""<tr>
+              <td><span class="vol-name">{html.escape(vol)}</span>{meta}</td>
+              <td><span class="badge {badge_cls}">{badge_text}</span></td>
+              <td><a class="del-btn" href="/delete?vol={quote(vol)}">✕</a></td>
             </tr>"""
-        for v in vols
-    )
     if not rows:
-        rows = '<tr><td colspan="2" style="color:#6c7086;text-align:center;">Список пуст</td></tr>'
+        rows = '<tr><td colspan="3" style="color:#6c7086;text-align:center;">Список пуст</td></tr>'
+
+    # Volumes discovered on connected external physical disks.
+    ext_rows = ""
+    available = 0
+    for index, info in enumerate(external):
+        name = info["name"]
+        added = name in configured
+        if not added:
+            available += 1
+        if info["mounted"]:
+            badge_cls, badge_text = "mounted", "смонтирован"
+        else:
+            badge_cls, badge_text = "unmounted", "не смонтирован"
+        meta_bits = [html.escape(info["device"])]
+        if info["mount_point"]:
+            meta_bits.append(html.escape(info["mount_point"]))
+        size = format_size(info["size"])
+        if size:
+            meta_bits.append(html.escape(size))
+        meta = '<div class="vol-meta">' + " · ".join(meta_bits) + "</div>"
+
+        if added:
+            check = '<span class="badge added">✓</span>'
+            name_html = f'<span class="vol-name">{html.escape(name)}</span>'
+            extra = '<div class="vol-meta">уже в списке</div>'
+        else:
+            check = (f'<input type="checkbox" class="vol-check" name="vol" '
+                     f'value="{html.escape(name)}" id="ext-{index}">')
+            name_html = (f'<label for="ext-{index}" class="vol-name">'
+                         f'{html.escape(name)}</label>')
+            extra = ""
+        ext_rows += f"""<tr>
+              <td class="check-cell">{check}</td>
+              <td>{name_html}{meta}</td>
+              <td><span class="badge {badge_cls}">{badge_text}</span>{extra}</td>
+            </tr>"""
+
+    empty_hint = ""
+    if external and not available:
+        empty_hint = '<p class="hint">Все подключённые внешние тома уже добавлены.</p>'
+    if external:
+        ext_block = f"""<form action="/add" method="get">
+      <table class="vol-table">
+        <thead><tr><th></th><th>Том</th><th>Статус</th></tr></thead>
+        <tbody>{ext_rows}</tbody>
+      </table>
+      <div class="add-actions">
+        <button type="submit" {'disabled' if not available else ''}>＋ Добавить выбранные</button>
+        <a class="refresh" href="/">↻ Обновить список</a>
+      </div>
+      {empty_hint}
+    </form>"""
+    else:
+        ext_block = ('<p class="hint">Внешние тома не найдены. Подключите SSD и '
+                     '<a class="refresh" href="/">обновите список</a>.</p>')
 
     status_html = ""
     if msg:
@@ -255,7 +479,7 @@ def render_html(msg="", error=False):
   }}
   .card {{
     background: var(--surface); border: 1px solid var(--border);
-    border-radius: 16px; padding: 32px; width: 520px;
+    border-radius: 16px; padding: 32px; width: 560px;
     box-shadow: 0 20px 60px rgba(0,0,0,.5);
   }}
   h1 {{ font-size: 22px; font-weight: 600; margin-bottom: 6px; }}
@@ -266,6 +490,15 @@ def render_html(msg="", error=False):
   table {{ width: 100%; border-collapse: collapse; }}
   td {{ padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 14px; }}
   tr:last-child td {{ border-bottom: none; }}
+  .vol-table th {{ color: var(--muted); font-size: 11px; font-weight: 600;
+                   text-align: left; padding: 0 12px 8px;
+                   border-bottom: 1px solid var(--border); }}
+  .vol-table td {{ vertical-align: middle; }}
+  .check-cell {{ width: 28px; padding-left: 0; }}
+  .vol-check {{ width: 16px; height: 16px; accent-color: var(--accent);
+                cursor: pointer; }}
+  .vol-meta {{ color: var(--muted); font-size: 11px; margin-top: 3px;
+               line-height: 1.3; }}
   .del-btn {{
     color: var(--red); text-decoration: none; font-size: 16px;
     font-weight: 700; float: right; line-height: 1;
@@ -273,16 +506,12 @@ def render_html(msg="", error=False):
     transition: background .15s;
   }}
   .del-btn:hover {{ background: rgba(243,139,168,.15); }}
-  .add-row {{ display: flex; gap: 8px; margin-top: 12px; }}
-  input[type=text], input[type=number] {{
+  input[type=number] {{
     background: var(--bg); border: 1px solid var(--border);
     border-radius: 8px; color: var(--text); font-size: 14px;
     padding: 9px 12px; outline: none; transition: border .2s;
   }}
-  input[type=text]:focus, input[type=number]:focus {{
-    border-color: var(--accent);
-  }}
-  input[type=text] {{ flex: 1; }}
+  input[type=number]:focus {{ border-color: var(--accent); }}
   input[type=number] {{ width: 72px; }}
   .timer-row {{ display: flex; align-items: center; gap: 12px; }}
   .timer-label {{ color: var(--muted); font-size: 13px; }}
@@ -294,6 +523,11 @@ def render_html(msg="", error=False):
     white-space: nowrap;
   }}
   button:hover, .btn:hover {{ opacity: .85; }}
+  button:disabled {{ opacity: .45; cursor: not-allowed; }}
+  .add-actions {{ display: flex; align-items: center; gap: 12px; margin-top: 12px; }}
+  .add-actions button {{ padding: 8px 14px; font-size: 13px; }}
+  .refresh {{ color: var(--muted); font-size: 12px; text-decoration: none; }}
+  .refresh:hover {{ color: var(--accent); }}
   .btn-save {{
     width: 100%; padding: 12px; font-size: 15px;
     border-radius: 10px; margin-top: 4px;
@@ -302,6 +536,13 @@ def render_html(msg="", error=False):
   .status.ok {{ background: rgba(166,227,161,.12); border: 1px solid var(--green); color: var(--green); }}
   .status.err {{ background: rgba(243,139,168,.12); border: 1px solid var(--red); color: var(--red); }}
   .vol-name {{ font-family: "SF Mono", monospace; font-size: 13px; }}
+  label.vol-name {{ cursor: pointer; }}
+  .badge {{ display: inline-block; padding: 2px 8px; border-radius: 999px;
+            font-size: 11px; white-space: nowrap; }}
+  .badge.mounted {{ color: var(--green); background: rgba(166,227,161,.12); }}
+  .badge.unmounted {{ color: #f9e2af; background: rgba(249,226,175,.12); }}
+  .badge.missing {{ color: var(--red); background: rgba(243,139,168,.12); }}
+  .badge.added {{ color: var(--green); background: rgba(166,227,161,.12); }}
   .check-row {{ display: flex; align-items: flex-start; gap: 10px; margin-bottom: 10px;
                 font-size: 13px; color: var(--text); }}
   .check-row input {{ margin-top: 2px; }}
@@ -314,13 +555,19 @@ def render_html(msg="", error=False):
   <p class="subtitle">Настройки фонового демона управления внешним SSD</p>
 
   <section>
-    <h2>Тома (volume names)</h2>
-    <table>{rows}</table>
-    <form class="add-row" action="/add" method="get">
-      <input type="text" name="vol" placeholder="Имя тома из diskutil list" required>
-      <button type="submit">＋ Добавить</button>
-    </form>
-    <p class="hint">Имя должно совпадать с названием тома. Если том сейчас не подключён,
+    <h2>Подключённые внешние тома</h2>
+    {ext_block}
+    <p class="hint">Показываются только физические внешние диски. Внутренние диски
+    и загрузочный том недоступны для выбора.</p>
+  </section>
+
+  <section>
+    <h2>Отслеживаемые тома</h2>
+    <table class="vol-table">
+      <thead><tr><th>Том</th><th>Статус</th><th></th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+    <p class="hint">Демон извлекает только эти тома. Если том сейчас не подключён,
     он начнёт отслеживаться, когда появится.</p>
   </section>
 
@@ -390,21 +637,54 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(render_html(msg, error))
 
         elif path == "/add":
-            vol = qs.get("vol", [""])[0].strip()
-            if not is_valid_volume_name(vol):
-                self._redirect("Некорректное имя тома", error=True)
+            requested = []
+            for raw in qs.get("vol", []):
+                vol = raw.strip()
+                if vol and vol not in requested:
+                    requested.append(vol)
+
+            if not requested:
+                self._redirect("Выберите хотя бы один том из списка", error=True)
                 return
-            cfg = load_config()
-            if vol not in cfg["volumes"]:
-                known = known_volume_names()
-                cfg["volumes"].append(vol)
-                save_config(cfg)
-                create_shortcut(vol)
-                if known and not any(n.startswith(vol) or vol.startswith(n) for n in known):
-                    self._redirect(f"Том «{vol}» добавлен, но сейчас не найден. "
-                                   "Он начнёт отслеживаться, когда появится.")
+            for vol in requested:
+                if not is_valid_volume_name(vol):
+                    self._redirect("Некорректное имя тома", error=True)
                     return
-            self._redirect(f"Добавлен том «{vol}» и создан ярлык на Рабочем столе")
+
+            external_names = {info["name"] for info in list_external_volumes()}
+            unknown = [vol for vol in requested if vol not in external_names]
+            if unknown:
+                self._redirect("Том не найден среди подключённых внешних: "
+                               + ", ".join(f"«{vol}»" for vol in unknown),
+                               error=True)
+                return
+
+            cfg = load_config()
+            added = []
+            already = []
+            for vol in requested:
+                if vol in cfg["volumes"]:
+                    already.append(vol)
+                else:
+                    cfg["volumes"].append(vol)
+                    added.append(vol)
+
+            if not added:
+                self._redirect("Эти тома уже добавлены: "
+                               + ", ".join(f"«{vol}»" for vol in already),
+                               error=True)
+                return
+
+            save_config(cfg)
+            for vol in added:
+                create_shortcut(vol)
+
+            msg = ("Добавлены тома: "
+                   + ", ".join(f"«{vol}»" for vol in added)
+                   + ". Ярлыки созданы на Рабочем столе")
+            if already:
+                msg += ". Уже были: " + ", ".join(f"«{vol}»" for vol in already)
+            self._redirect(msg)
 
         elif path == "/delete":
             vol = qs.get("vol", [""])[0].strip()
