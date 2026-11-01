@@ -41,7 +41,7 @@ cat > "$PLIST_DIR/$PLIST_FILE" << EOF
     <key>KeepAlive</key>
     <true/>
     <key>ThrottleInterval</key>
-    <integer>10</integer>
+    <integer>1</integer>
     <key>StandardOutPath</key>
     <string>$LOG_DIR/SmartSSDManager.log</string>
     <key>StandardErrorPath</key>

@@ -11,8 +11,9 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 from xml.sax.saxutils import escape as xml_escape
 
@@ -144,13 +145,30 @@ def create_shortcut(vol: str):
     with open(launcher, "w") as f:
         f.write(LAUNCHER_SH.format(volq=shlex.quote(vol)))
     os.chmod(launcher, 0o755)
-    subprocess.run([LSREGISTER, "-f", app], capture_output=True)
+    try:
+        subprocess.run([LSREGISTER, "-f", app], capture_output=True, timeout=10)
+    except Exception:
+        pass
 
 def remove_shortcut(vol: str):
     app = os.path.join(DESKTOP, f"{vol}.app")
     if os.path.exists(app):
-        subprocess.run([LSREGISTER, "-u", app], capture_output=True)
+        try:
+            subprocess.run([LSREGISTER, "-u", app], capture_output=True, timeout=10)
+        except Exception:
+            pass
         shutil.rmtree(app)
+
+def _launchctl(args, timeout=10):
+    try:
+        return subprocess.run(["/bin/launchctl"] + args,
+                              capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+def _service_loaded(service):
+    result = _launchctl(["print", service], timeout=5)
+    return result is not None and result.returncode == 0
 
 def restart_daemon():
     disabled = PLIST_PATH + ".disabled"
@@ -160,19 +178,38 @@ def restart_daemon():
         return False, "LaunchAgent не найден. Запустите install.sh."
 
     domain = f"gui/{os.getuid()}"
-    subprocess.run(["/bin/launchctl", "bootout", f"{domain}/{LABEL}"],
-                   capture_output=True)
-    subprocess.run(["/bin/launchctl", "enable", f"{domain}/{LABEL}"],
-                   capture_output=True)
-    result = subprocess.run(["/bin/launchctl", "bootstrap", domain, PLIST_PATH],
-                            capture_output=True, text=True)
-    if result.returncode != 0:
-        fallback = subprocess.run(["/bin/launchctl", "load", "-w", PLIST_PATH],
-                                  capture_output=True, text=True)
-        if fallback.returncode != 0:
-            err = (result.stderr or fallback.stderr or "launchctl error").strip()
-            return False, f"Не удалось запустить демон: {err}"
-    return True, "Демон перезапущен с новыми настройками"
+    service = f"{domain}/{LABEL}"
+
+    # Обычный случай: сервис уже загружен. kickstart -k перезапускает его
+    # без bootout/bootstrap и без гонки, из-за которой сервис мог исчезнуть.
+    if _service_loaded(service):
+        result = _launchctl(["kickstart", "-k", service])
+        if result is not None and result.returncode == 0:
+            time.sleep(0.3)
+            if _service_loaded(service):
+                return True, "Демон перезапущен с новыми настройками"
+
+    # Сервис не загружен (или kickstart не сработал): полный bootstrap.
+    _launchctl(["bootout", service])
+    deadline = time.time() + 5
+    while time.time() < deadline and _service_loaded(service):
+        time.sleep(0.2)
+
+    _launchctl(["enable", service])
+    last_error = "launchctl не ответил"
+    for _ in range(2):
+        result = _launchctl(["bootstrap", domain, PLIST_PATH])
+        if result is not None and result.returncode == 0:
+            time.sleep(0.2)
+            if _service_loaded(service):
+                return True, "Демон перезапущен с новыми настройками"
+            last_error = "bootstrap вернул успех, но сервис не загрузился"
+        elif result is not None:
+            last_error = (result.stderr or result.stdout or
+                          "launchctl bootstrap error").strip()
+        time.sleep(0.5)
+
+    return False, f"Не удалось запустить демон: {last_error}"
 
 # ── HTML ────────────────────────────────────────────────────────────────────────
 def render_html(msg="", error=False):
@@ -410,17 +447,22 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._respond("<h1>404</h1>", 404)
 
+class SettingsServer(ThreadingHTTPServer):
+    daemon_threads = True
+
 # ── Entry point ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     url = f"http://127.0.0.1:{PORT}/"
     try:
-        server = HTTPServer(("127.0.0.1", PORT), Handler)
+        server = SettingsServer(("127.0.0.1", PORT), Handler)
     except OSError:
         # Another instance is already running — just open it.
-        webbrowser.open(url)
+        if not os.environ.get("SMARTSSD_NO_BROWSER"):
+            webbrowser.open(url)
         sys.exit(0)
 
-    threading.Timer(0.3, lambda: webbrowser.open(url)).start()
+    if not os.environ.get("SMARTSSD_NO_BROWSER"):
+        threading.Timer(0.3, lambda: webbrowser.open(url)).start()
     print(f"SmartSSD Settings running at {url}  (close browser tab to stop)")
     try:
         server.serve_forever()
