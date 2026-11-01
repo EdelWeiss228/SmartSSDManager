@@ -192,9 +192,12 @@ def list_external_volumes():
             "whole_disk": whole_id,
         })
 
-    # Ordinary partitions: ExFAT, NTFS, HFS+, FAT, etc.
+    # Ordinary partitions: ExFAT, NTFS, HFS+, FAT, etc. EFI system
+    # partitions are not user data and must not be offered.
     for whole_id in external:
         for part in whole_entries[whole_id].get("Partitions") or []:
+            if part.get("Content") == "EFI":
+                continue
             add_volume(part.get("VolumeName"), part.get("DeviceIdentifier"),
                        part.get("MountPoint"), part.get("Size"), whole_id)
 
